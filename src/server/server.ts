@@ -217,26 +217,43 @@ function votedOnDay(voter: string, day: string): boolean {
   );
 }
 
-/** O dia já tem vencedor (votação encerrada). */
-function dayClosed(day: string): boolean {
-  return state.events.some((e) => e.date === day && state.reserved[e.id] === "votacao");
+/** Data de hoje no fuso de Recife (AGENDA_TODAY sobrescreve, usado em testes). */
+function todayInRecife(): string {
+  if (process.env.AGENDA_TODAY) return process.env.AGENDA_TODAY;
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Recife",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 }
 
-/** Encerra a votação do dia: o único mais votado vai para Reservados. */
-function closeVoting(day: string): string | null {
-  if (dayClosed(day)) return "A votação deste dia já foi encerrada.";
+/** A votação de um dia termina quando chega a data do evento. */
+function dayArrived(day: string): boolean {
+  return day <= todayInRecife();
+}
 
-  const counts = state.events
-    .filter((e) => e.date === day && !state.reserved[e.id])
-    .map((e) => ({ id: e.id, n: (state.votes[e.id] ?? []).length }))
-    .sort((a, b) => b.n - a.n);
+/** Ao chegar a data, o único mais votado do dia vai para Reservados. Empate não reserva. */
+function settleDueDays(): boolean {
+  let changed = false;
+  const days = new Set(state.events.map((e) => e.date));
+  for (const day of days) {
+    if (!dayArrived(day)) continue;
+    const hasWinner = state.events.some((e) => e.date === day && state.reserved[e.id]);
+    if (hasWinner) continue;
 
-  const top = counts[0];
-  if (!top || top.n === 0) return "Ninguém votou neste dia ainda.";
-  if (counts[1] && counts[1].n === top.n) return "Empate: a votação continua até haver um vencedor.";
+    const counts = state.events
+      .filter((e) => e.date === day)
+      .map((e) => ({ id: e.id, n: (state.votes[e.id] ?? []).length }))
+      .sort((a, b) => b.n - a.n);
+    const top = counts[0];
+    if (!top || top.n === 0) continue;
+    if (counts[1] && counts[1].n === top.n) continue;
 
-  state.reserved[top.id] = "votacao";
-  return null;
+    state.reserved[top.id] = "votacao";
+    changed = true;
+  }
+  return changed;
 }
 
 // ---------- WebSocket ----------
@@ -257,6 +274,7 @@ function broadcastState(): void {
 }
 
 function handleMessage(ws: WebSocket, raw: string): void {
+  if (settleDueDays()) scheduleSave();
   let msg: ClientMessage;
   try {
     msg = JSON.parse(raw) as ClientMessage;
@@ -270,25 +288,9 @@ function handleMessage(ws: WebSocket, raw: string): void {
       const voter = text(msg.voterId, 64);
       if (!ev || !VOTER_RE.test(voter)) return sendError(ws, "Não foi possível registrar o voto.");
       if (state.reserved[ev.id]) return sendError(ws, "Este evento já está reservado.");
-      if (dayClosed(ev.date)) return sendError(ws, "A votação deste dia já foi encerrada.");
+      if (dayArrived(ev.date)) return sendError(ws, "A votação deste dia já terminou.");
       if (votedOnDay(voter, ev.date)) return sendError(ws, "Você já votou neste dia.");
       state.votes[ev.id] = [...(state.votes[ev.id] ?? []), voter];
-      break;
-    }
-
-    case "closeVoting": {
-      const day = text(msg.date, 10);
-      const problem = closeVoting(day);
-      if (problem) return sendError(ws, problem);
-      break;
-    }
-
-    case "reserve": {
-      const ev = state.events.find((e) => e.id === msg.eventId);
-      if (!ev) return sendError(ws, "Evento não encontrado.");
-      if (state.reserved[ev.id] === "votacao") return sendError(ws, "Este evento foi reservado pela votação.");
-      if (state.reserved[ev.id]) delete state.reserved[ev.id];
-      else state.reserved[ev.id] = "manual";
       break;
     }
 
@@ -308,14 +310,15 @@ function handleMessage(ws: WebSocket, raw: string): void {
       const ev = state.events.find((e) => e.id === msg.eventId);
       const next = ev ? sanitizeEvent({ ...ev, date: msg.date, start: msg.start, end: msg.end }, ev.id) : null;
       if (!ev || !next) return sendError(ws, "Não foi possível salvar o horário.");
+      // trocar o dia depois de haver votos mudaria a votação de outro dia
+      const changesDay = next.date !== ev.date;
+      if (changesDay && ((state.votes[ev.id] ?? []).length > 0 || state.reserved[ev.id])) {
+        return sendError(ws, "Não dá para mudar o dia de um evento que já recebeu votos.");
+      }
+      if (dayArrived(next.date) && next.date !== ev.date) {
+        return sendError(ws, "Não dá para mudar para um dia que já chegou.");
+      }
       Object.assign(ev, { date: next.date, start: next.start, end: next.end });
-      break;
-    }
-
-    case "removeEvent": {
-      state.events = state.events.filter((ev) => ev.id !== msg.eventId);
-      delete state.votes[msg.eventId];
-      delete state.reserved[msg.eventId];
       break;
     }
 
@@ -369,6 +372,15 @@ wss.on("connection", (ws) => {
   ws.on("message", (data) => handleMessage(ws, data.toString()));
 });
 
+// confere os vencedores a cada minuto, mesmo sem ninguém conectado
+setInterval(() => {
+  if (settleDueDays()) {
+    scheduleSave();
+    broadcastState();
+  }
+}, 60_000);
+
 httpServer.listen(PORT, () => {
+  if (settleDueDays()) scheduleSave();
   console.log(`Agenda rodando em http://localhost:${PORT}`);
 });

@@ -31,19 +31,16 @@ export interface AgendaState {
   events: AgendaEvent[];
   /** eventId -> ids dos navegadores que votaram (um voto por navegador por dia) */
   votes: Record<string, string[]>;
-  /** eventId -> origem da reserva: "votacao" (vencedor) ou "manual" */
-  reserved: Record<string, "votacao" | "manual">;
+  /** eventId -> "votacao": o mais votado do dia, reservado na data do evento */
+  reserved: Record<string, "votacao">;
 }
 
 export type ListKind = "favorites" | "reserved";
 
 export type ClientMessage =
   | { type: "vote"; eventId: string; voterId: string }
-  | { type: "closeVoting"; date: string }
-  | { type: "reserve"; eventId: string }
   | { type: "addEvent"; event: Omit<AgendaEvent, "id"> }
-  | { type: "updateEvent"; eventId: string; date: string; start: string; end: string }
-  | { type: "removeEvent"; eventId: string };
+  | { type: "updateEvent"; eventId: string; date: string; start: string; end: string };
 
 export type ServerMessage =
   | { type: "state"; state: AgendaState }

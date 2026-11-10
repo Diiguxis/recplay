@@ -101,13 +101,35 @@ function voterId(): string {
   } catch {
     /* sem armazenamento: vale só nesta sessão */
   }
-  voterCache = crypto.randomUUID();
+  voterCache = newVoterId();
   try {
     localStorage.setItem(VOTER_KEY, voterCache);
   } catch {
     /* ignora */
   }
   return voterCache;
+}
+
+/** crypto.randomUUID só existe em contexto seguro (https/localhost); usa getRandomValues como alternativa. */
+function newVoterId(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Data de hoje no fuso de Recife, no mesmo formato YYYY-MM-DD do servidor. */
+function todayInRecife(): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Recife",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+/** A votação de um dia termina quando chega a data do evento. */
+function dayArrived(day: string): boolean {
+  return day <= todayInRecife();
 }
 
 function voteCount(eventId: string): number {
@@ -380,16 +402,18 @@ function updateList(): void {
 
 /** Faixa de status da votação do dia selecionado. */
 function votingBanner(): string {
-  const closed = dayHasWinner(selectedDay);
+  const arrived = dayArrived(selectedDay);
+  const winnerDone = dayHasWinner(selectedDay);
   const voted = votedOnDay(selectedDay);
-  const hasVotes = state.events.some((e) => e.date === selectedDay && voteCount(e.id) > 0 && !isReserved(e.id));
   const l = dayLabel(selectedDay);
 
-  const status = closed
-    ? "Votação encerrada: o vencedor já está em Reservados."
-    : voted
-      ? "Seu voto deste dia já foi registrado. Aguarde o encerramento."
-      : "Você ainda pode votar uma vez neste dia.";
+  const status = winnerDone
+    ? "O vencedor deste dia já está em Reservados."
+    : arrived
+      ? "Votação encerrada. Sem vencedor: houve empate ou ninguém votou."
+      : voted
+        ? "Seu voto deste dia já foi registrado. O mais votado vai para Reservados na data do evento."
+        : "Vote uma vez neste dia. Na data do evento, o mais votado vai para Reservados.";
 
   return `
     <div class="vote-banner">
@@ -397,9 +421,6 @@ function votingBanner(): string {
         <b>Votação de ${l.num} ${cap(l.month)}</b>
         <small>${esc(status)}</small>
       </div>
-      ${!closed && hasVotes
-        ? `<button class="secondary" data-action="close-voting" data-date="${selectedDay}">Encerrar votação</button>`
-        : ""}
     </div>`;
 }
 
@@ -410,7 +431,7 @@ function renderCard(ev: AgendaEvent, enter: boolean, delay: number): string {
   const votes = voteCount(ev.id);
   const winner = state.reserved[ev.id] === "votacao";
   const reserved = isReserved(ev.id);
-  const blocked = !!reserved || votedOnDay(ev.date) && !mine || dayHasWinner(ev.date);
+  const blocked = !!reserved || (votedOnDay(ev.date) && !mine) || dayHasWinner(ev.date) || dayArrived(ev.date);
   const names = ev.speakers.map((s) => s.name);
   const speakersText = names.length ? names.join(", ") : "A definir";
 
@@ -497,7 +518,7 @@ function eventDetail(ev: AgendaEvent): string {
   const mine = iVoted(ev.id);
   const reserved = isReserved(ev.id);
   const winner = state.reserved[ev.id] === "votacao";
-  const dayClosed = dayHasWinner(ev.date);
+  const dayClosed = dayHasWinner(ev.date) || dayArrived(ev.date);
   const canVote = !reserved && !dayClosed && (mine || !votedOnDay(ev.date));
   const voteLabel = mine
     ? "Seu voto"
@@ -541,15 +562,12 @@ function eventDetail(ev: AgendaEvent): string {
 
       <div class="vote-panel">
         <p class="vote-meta"><b>${voteCount(ev.id)}</b> voto(s)${winner ? " · 🏆 vencedor da votação" : ""}</p>
-        <div class="actions">
+        <div class="actions actions-single">
           <button class="${mine ? "primary on" : "primary"}" data-action="vote" data-id="${esc(ev.id)}" ${canVote ? "" : "disabled"}>
             ${ICON.heart(mine)} ${esc(voteLabel)}
           </button>
-          <button class="${reserved ? "secondary on" : "secondary"}" data-action="reserve" data-id="${esc(ev.id)}" ${winner ? "disabled" : ""}>
-            ${ICON.bookmark} ${reserved ? "Reservado" : "Reservar"}
-          </button>
         </div>
-        <p class="muted small">Cada navegador vota uma vez por dia. O voto não pode ser desfeito.</p>
+        <p class="muted small">Cada navegador vota uma vez por dia. O voto não pode ser desfeito. Na data do evento, o mais votado vai para Reservados.</p>
       </div>
 
       ${ev.link ? `
@@ -579,7 +597,6 @@ function eventDetail(ev: AgendaEvent): string {
         ${ev.speakers.map(renderSpeaker).join("")}
       </section>` : ""}
 
-      <button class="danger" data-action="remove" data-id="${esc(ev.id)}">Excluir evento</button>
     </div>`;
 }
 
@@ -623,7 +640,8 @@ function vote(eventId: string): void {
   if (!ev) return;
   if (iVoted(eventId)) return toast("Você já votou neste evento.");
   if (votedOnDay(ev.date)) return toast("Você já votou neste dia. Cada navegador tem um voto por dia.");
-  if (dayHasWinner(ev.date)) return toast("A votação deste dia já foi encerrada.");
+  if (dayArrived(ev.date)) return toast("A votação terminou: o evento já chegou à data.");
+  if (dayHasWinner(ev.date)) return toast("Este dia já tem um vencedor reservado.");
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     return toast("Sem conexão com o servidor. Tentando reconectar...");
   }
@@ -635,15 +653,6 @@ function vote(eventId: string): void {
   send({ type: "vote", eventId, voterId: voterId() });
 }
 
-function reserve(eventId: string): void {
-  send({ type: "reserve", eventId });
-}
-
-function closeVoting(day: string): void {
-  if (confirm(`Encerrar a votação de ${dayLabel(day).num} ${dayLabel(day).month}? O mais votado vai para Reservados.`)) {
-    send({ type: "closeVoting", date: day });
-  }
-}
 
 /** Busca título e imagem no link oficial e cria o evento automaticamente. */
 async function addByLink(form: HTMLFormElement): Promise<void> {
@@ -756,13 +765,6 @@ document.addEventListener("click", (e) => {
       vote(id);
       break;
 
-    case "reserve":
-      reserve(id);
-      break;
-
-    case "close-voting":
-      closeVoting(el.dataset.date ?? selectedDay);
-      break;
 
     case "copy-agenda":
       void copyText(location.href, "Link da agenda copiado!");
@@ -772,12 +774,6 @@ document.addEventListener("click", (e) => {
       void copyText(el.dataset.link ?? "", "Link do evento copiado!");
       break;
 
-    case "remove":
-      if (confirm("Excluir este evento para todo mundo?")) {
-        send({ type: "removeEvent", eventId: id });
-        closeModal();
-      }
-      break;
 
     case "new-event":
       modal = { kind: "form" };
